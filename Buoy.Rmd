@@ -1,0 +1,421 @@
+---
+title: "Buoy"
+author: "Yibing Wang"
+date: "2024-09-26"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(data.table)
+library(lubridate)
+library(dplyr)
+library(ggplot2)
+library(corrplot)
+```
+
+```{r}
+file_root <- "https://www.ndbc.noaa.gov/view_text_file.php?filename=44013h"
+tail <- ".txt.gz&dir=data/historical/stdmet/"
+
+years <- 1985:2023
+
+all_data <- list()
+
+# Loop Through Each Year
+for (year in years) {
+  path <- paste0(file_root, year, tail)
+  # Skip line
+  temp_lines <- readLines(path, n = 2)
+  skip_lines <- if (grepl("YYYY", temp_lines[2])) 1 else 2
+  
+  # Read Header
+  header <- tryCatch({
+    scan(path, what = 'character', nlines = 1, quiet = TRUE)
+  }, error = function(e) NULL)
+  
+  # if the Header is Successfully Read
+  if (!is.null(header)) {
+    buoy_data <- fread(path, header = FALSE, skip = skip_lines, fill = Inf)
+    # Adjust Column Names Based on the Header
+    if (ncol(buoy_data) > length(header)) {
+      setnames(buoy_data, 1:length(header), header)
+      additional_cols <- ncol(buoy_data) - length(header)
+      if (additional_cols > 0) {
+        # Name Extra Columns as V1, V2, V3.
+        setnames(buoy_data, (length(header) + 1):ncol(buoy_data), paste0("V", 1:additional_cols))
+      }
+    } else {
+      setnames(buoy_data, header)
+    }
+    
+    # date to integers
+    date_cols <- intersect(c("YY", "YYYY", "#YY", "MM", "DD", "hh"), names(buoy_data))
+    buoy_data[, (date_cols) := lapply(.SD, as.integer), .SDcols = date_cols]
+    
+    if (all(c("YY", "MM", "DD", "hh") %in% colnames(buoy_data))) {
+      # Adjust to YYYY
+      buoy_data[, date := make_datetime(1900 + YY, MM, DD, hh)]
+    } else if (all(c("YYYY", "MM", "DD", "hh") %in% colnames(buoy_data))) {
+      buoy_data[, date := make_datetime(YYYY, MM, DD, hh)]
+    }
+    
+    #"TIDE" 
+    buoy_data[, TIDE := NA_real_]
+    
+    # Store the Data Table in the List
+    all_data[[as.character(year)]] <- buoy_data
+  }
+}
+
+# Combine All Data
+full_dataset <- rbindlist(all_data, fill = TRUE)
+
+# to YYYY
+if ("YY" %in% names(full_dataset)) {
+  full_dataset[, YY := as.integer(YY)]
+  full_dataset[, YY := ifelse(!is.na(YY), 1900 + YY, YY)]
+}
+
+# Merge into 'year' Column
+if ("#YY" %in% names(full_dataset)) {
+  full_dataset[, `#YY` := as.numeric(sub("^#", "", `#YY`))]
+}
+
+full_dataset[, year := fcoalesce(as.numeric(YYYY),
+                                 as.numeric(YY),
+                                 as.numeric(`#YY`))]
+
+# Remove YYYY, YY, #YY
+full_dataset[, c("YYYY", "YY", "#YY") := NULL]
+
+# Reorder 'year' at the Beginning
+setcolorder(full_dataset, c("year", setdiff(names(full_dataset), "year")))
+
+# 'WDIR'
+full_dataset[, WDIR := fcoalesce(as.numeric(WDIR), as.numeric(WD))]
+full_dataset[, WD := NULL]
+full_dataset[, PRES := fcoalesce(as.numeric(PRES), as.numeric(BAR))]
+full_dataset[, BAR := NULL]
+
+print(head(full_dataset))
+```
+# Part B
+
+```{r}
+# List of variables to check for placeholder values
+variables_to_check <- c("WDIR", "WSPD", "GST", "WVHT", "DPD", "APD", "MWD", "PRES", "ATMP", "WTMP", "DEWP", "VIS")
+
+# replace 999 with NA
+replace_placeholders <- function(x) {
+  x_numeric <- as.numeric(x)
+  x_numeric[x_numeric %in% c(999, 9999, 999.0, 9999.0)] <- NA
+  return(x_numeric)
+}
+
+for (var in variables_to_check) {
+  if (var %in% names(full_dataset)) {
+    full_dataset[, (var) := replace_placeholders(get(var))]
+  }
+}
+
+print(head(full_dataset))
+```
+
+```{r}
+# Add 'date' column; 'date' format; number of NAs per variable
+if (!"date" %in% names(full_dataset)) {
+  full_dataset[, date := make_datetime(year, MM, DD, hh)]
+}
+full_dataset[, date := as.POSIXct(date)]
+
+na_counts <- sapply(full_dataset[, variables_to_check, with = FALSE], function(x) sum(is.na(x)))
+print(na_counts)
+```
+
+```{r}
+na_by_year <- full_dataset[, lapply(.SD, function(x) sum(is.na(x))), by = year, .SDcols = variables_to_check]
+
+na_by_year_melted <- melt(na_by_year, id.vars = "year", variable.name = "Variable", value.name = "NA_Count")
+ggplot(na_by_year_melted, aes(x = factor(year), y = NA_Count, fill = Variable)) +
+  geom_bar(stat = "identity") +
+  facet_wrap(~ Variable, scales = "free_y") +
+  labs(title = "Number of Missing Values per Variable by Year",
+       x = "Year",
+       y = "Count of Missing Values") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+```
+
+```{r}
+ggplot(na_by_year_melted, aes(x = factor(year), y = NA_Count, fill = Variable)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  labs(title = "Number of Missing Values per Variable by Year",
+       x = "Year",
+       y = "Count of Missing Values",
+       fill = "Variable") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1),
+        legend.position = "bottom")
+```
+I think it is important to convert missing data to NA, but it is not always appropriate. 
+converting to NA can help us using r function better since it is the standard representation for missing value in r. 
+However, in some cases, if we convert the data to NA without fully understand the meaning, it might lead to misinterpretation of the data. 
+
+# C
+
+```{r}
+temperature_vars <- c("ATMP", "WTMP")
+for (var in temperature_vars) {
+  if (var %in% names(full_dataset)) {
+    full_dataset[, (var) := as.numeric(get(var))]
+  }
+}
+atmp_data <- full_dataset[!is.na(ATMP) & year <= 2006]
+wtmp_data <- full_dataset[!is.na(WTMP)]
+```
+
+```{r}
+# annual mean ATMP
+annual_atmp <- atmp_data[, .(
+  Mean_ATMP = mean(ATMP, na.rm = TRUE)
+), by = year]
+```
+
+```{r}
+# annual mean WTMP
+annual_wtmp <- wtmp_data[, .(
+  Mean_WTMP = mean(WTMP, na.rm = TRUE)
+), by = year]
+```
+
+```{r}
+ggplot(annual_atmp, aes(x = year, y = Mean_ATMP)) +
+  geom_line(color = "blue") +
+  geom_point(color = "blue") +
+  labs(title = "Annual Average Air Temperature (ATMP)",
+       x = "Year",
+       y = "Mean Air Temperature (°C)") +
+  theme_minimal()
+```
+
+```{r}
+ggplot(annual_wtmp, aes(x = year, y = Mean_WTMP)) +
+  geom_line(color = "red") +
+  geom_point(color = "red") +
+  labs(title = "Annual Average Water Temperature (WTMP)",
+       x = "Year",
+       y = "Mean Water Temperature (°C)") +
+  theme_minimal()
+```
+
+```{r}
+#up to 2006
+if (nrow(annual_atmp) >= 3) {  # Ensure enough data points
+  model_ATMP <- lm(Mean_ATMP ~ year, data = annual_atmp)
+  summary_ATMP <- summary(model_ATMP)
+  print(summary_ATMP)
+  
+  rate_ATMP_per_decade <- coef(model_ATMP)["year"] * 10
+  cat("Air Temperature is changing at a rate of ", round(rate_ATMP_per_decade, 4), "°C per decade (up to 2006).\n")
+  plot(model_ATMP)
+} else {
+  cat("Not enough data points for ATMP to perform regression analysis.\n")
+}
+```
+
+```{r}
+if (nrow(annual_wtmp) >= 3) {
+  model_WTMP <- lm(Mean_WTMP ~ year, data = annual_wtmp)
+  summary_WTMP <- summary(model_WTMP)
+  print(summary_WTMP)
+  
+  rate_WTMP_per_decade <- coef(model_WTMP)["year"] * 10
+  cat("Water Temperature is changing at a rate of ", round(rate_WTMP_per_decade, 4), "°C per decade.\n")
+  plot(model_WTMP)
+} else {
+  cat("Not enough data points for WTMP to perform regression analysis.\n")
+}
+```
+
+# D
+
+```{r}
+rainfall_data <- read.csv("Rainfall.csv")
+summary(rainfall_data)
+```
+
+```{r}
+rainfall_data$DATE <- as.POSIXct(rainfall_data$DATE, format="%Y%m%d %H:%M")
+rainfall_data <- rainfall_data %>%
+  mutate(
+    year = format(DATE, "%Y"),
+    MM = format(DATE, "%m"),
+    DD = format(DATE, "%d"),
+    HH = format(DATE, "%H")
+  )
+```
+
+```{r}
+# rainfall(HPCP)
+rainfall_summary <- rainfall_data %>%
+  summarize(
+    count = n(),
+    mean = mean(HPCP, na.rm = TRUE),
+    std = sd(HPCP, na.rm = TRUE),
+    min = min(HPCP, na.rm = TRUE),
+    Q1 = quantile(HPCP, 0.25, na.rm = TRUE),
+    median = median(HPCP, na.rm = TRUE),
+    Q3 = quantile(HPCP, 0.75, na.rm = TRUE),
+    max = max(HPCP, na.rm = TRUE)
+  )
+
+print(rainfall_summary)
+```
+
+```{r}
+ggplot(rainfall_data, aes(x = HPCP)) +
+  geom_histogram(binwidth = 0.01, fill = "blue", color = "black") +
+  labs(title = "Distribution of Rainfall", x = "Rainfall", y = "Frequency")
+```
+
+
+```{r}
+total_precipitation <- rainfall_data %>%
+  group_by(year) %>%
+  summarize(total_precipitation = sum(HPCP, na.rm = TRUE))
+
+ggplot(total_precipitation, aes(x = as.numeric(year), y = total_precipitation)) +
+  geom_line(color = "blue") +
+  geom_point(color = "red") +
+  labs(title = "Total Annual Precipitation", x = "Year", y = "Total Precipitation (inches)") +
+  theme_minimal()
+```
+
+```{r}
+average_precipitation <- rainfall_data %>%
+  group_by(year) %>%
+  summarize(average_precipitation = mean(HPCP, na.rm = TRUE))
+
+ggplot(average_precipitation, aes(x = as.numeric(year), y = average_precipitation)) +
+  geom_line(color = "green") +
+  geom_point(color = "orange") +
+  labs(title = "Average Annual Precipitation", x = "Year", y = "Average Precipitation") +
+  theme_minimal()
+```
+
+```{r}
+# total precipitation for each month
+monthly_precipitation <- rainfall_data %>%
+  group_by(year, MM) %>%
+  summarize(total_monthly_precipitation = sum(HPCP, na.rm = TRUE))
+```
+
+```{r}
+ggplot(monthly_precipitation, aes(x = MM, y = total_monthly_precipitation)) +
+  geom_boxplot(aes(group = MM), fill = "lightblue") +
+  facet_wrap(~ year) +
+  labs(title = "Distribution of Monthly Precipitation for Each Year",
+       x = "Month",
+       y = "Total Precipitation (inches)") +
+  theme_minimal()
+```
+
+```{r}
+#buoy
+atmp_data <- full_dataset[!is.na(ATMP) & year <= 2006]
+
+monthly_atmp <- atmp_data[, .(
+  Mean_ATMP = mean(ATMP, na.rm = TRUE)
+), by = .(year, MM)]
+
+monthly_atmp[, date := as.Date(paste(year, MM, "01", sep = "-"))]
+
+wtmp_data <- full_dataset[!is.na(WTMP) & year <= 2006]
+
+monthly_wtmp <- wtmp_data[, .(
+  Mean_WTMP = mean(WTMP, na.rm = TRUE)
+), by = .(year, MM)]
+
+monthly_wtmp[, date := as.Date(paste(year, MM, "01", sep = "-"))]
+```
+
+```{r}
+ggplot(monthly_atmp, aes(x = date, y = Mean_ATMP)) +
+  geom_line(color = "blue") +
+  labs(title = "Monthly Average Air Temperature (ATMP) up to 2006",
+       x = "Date",
+       y = "Mean Air Temperature (°C)") +
+  theme_minimal()
+```
+
+```{r}
+ggplot(monthly_wtmp, aes(x = date, y = Mean_WTMP)) +
+  geom_line(color = "red") +
+  labs(title = "Monthly Average Water Temperature (WTMP)",
+       x = "Date",
+       y = "Mean Water Temperature (°C)") +
+  theme_minimal()
+```
+
+```{r}
+#ATMP
+ggplot(atmp_data, aes(x = factor(MM), y = ATMP)) +
+  geom_boxplot(aes(group = MM), fill = "lightblue") +
+  facet_wrap(~ year, ncol = 4) +
+  labs(title = "Distribution of Monthly Air Temperature (ATMP) for Each Year up to 2006",
+       x = "Month",
+       y = "Air Temperature (°C)") +
+  theme_minimal()
+```
+
+```{r}
+#WTMP
+ggplot(wtmp_data, aes(x = factor(MM), y = WTMP)) +
+  geom_boxplot(aes(group = MM), fill = "lightblue") +
+  facet_wrap(~ year, ncol = 4) +
+  labs(title = "Distribution of Monthly Water Temperature (WTMP) for Each Year",
+       x = "Month",
+       y = "Water Temperature (°C)") +
+  theme_minimal()
+```
+
+```{r}
+monthly_precipitation$year <- as.numeric(monthly_precipitation$year)
+monthly_precipitation$MM <- as.numeric(monthly_precipitation$MM)
+
+merged_data <- monthly_atmp %>%
+  inner_join(monthly_wtmp, by = c("year", "MM")) %>%
+  inner_join(monthly_precipitation, by = c("year", "MM"))
+```
+
+```{r}
+#correlation
+selected_data <- merged_data %>%
+  select(Mean_ATMP, Mean_WTMP, total_monthly_precipitation)
+
+#correlation matrix
+correlation_matrix <- cor(selected_data, use = "complete.obs")
+
+corrplot::corrplot(correlation_matrix, method = "circle", type = "upper", 
+                   tl.col = "black", title = "Correlation Matrix", mar = c(0, 0, 2, 0))
+```
+Strong correlation between air and water temperatures, but weak negative correlation with precipitation
+
+
+```{r}
+model <- lm(total_monthly_precipitation ~ Mean_ATMP + Mean_WTMP, data = merged_data)
+
+summary(model)
+plot(model)
+```
+Just like what the correlation matrix tells me, a linear model won't be a good idea to use for finding the relationship between Buoy data and precipitation.
+
+
+```
+
